@@ -1,407 +1,306 @@
-import re
-import asyncio
-import aiohttp
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
-from telegram.constants import ParseMode
+# ================== BOTFLOW V3 (CLEAN) ==================
+import re, asyncio, aiohttp
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Tuple
+
+from telegram import (
+    Update, InlineKeyboardMarkup, InlineKeyboardButton
+)
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
 
+# ----------------- UTIL -----------------
 
-# ─────────────────────────────────────────────
-# PARSER
-# ─────────────────────────────────────────────
-
-def parse(script: str):
-    """Parse the DSL script into a token and a dict of flows."""
-    token = None
-    flows = {}
-    current_flow = None
-
-    lines = script.splitlines()
-    i = 0
-
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-
-        # skip blank lines and comments
-        if not stripped or stripped.startswith("#"):
-            i += 1
-            continue
-
-        indent = len(line) - len(line.lstrip())
-
-        # top-level directives (no indent)
-        if indent == 0:
-            if stripped.startswith("token "):
-                token = stripped[6:].strip()
-            elif stripped.startswith("flow "):
-                current_flow = stripped[5:].strip()
-                flows[current_flow] = []
-
-        # flow body (indented)
-        elif current_flow is not None:
-            node, i = _parse_node(lines, i, indent)
-            if node:
-                flows[current_flow].append(node)
-            continue
-
-        i += 1
-
-    return token, flows
-
-
-def _parse_node(lines, i, base_indent):
-    """Parse a single node from the current line, consuming extra lines if needed."""
-    line = lines[i]
-    stripped = line.strip()
-    i += 1
-
-    # SEND
-    if stripped.startswith("send "):
-        return {"type": "send", "text": stripped[5:]}, i
-
-    # IMAGE
-    if stripped.startswith("image "):
-        return {"type": "image", "url": stripped[6:].strip()}, i
-
-    # INPUT
-    if stripped.startswith("input "):
-        parts = stripped[6:].split(" ", 1)
-        var = parts[0]
-        prompt = parts[1] if len(parts) > 1 else f"Enter {var}:"
-        return {"type": "input", "var": var, "text": prompt}, i
-
-    # SET
-    if stripped.startswith("set "):
-        rest = stripped[4:]
-        var, _, val = rest.partition("=")
-        return {"type": "set", "var": var.strip(), "value": val.strip()}, i
-
-    # FETCH
-    if stripped.startswith("fetch "):
-        parts = stripped[6:].split(" ", 1)
-        return {"type": "fetch", "var": parts[0], "url": parts[1].strip()}, i
-
-    # GO
-    if stripped.startswith("go "):
-        return {"type": "go", "flow": stripped[3:].strip()}, i
-
-    # DELAY
-    if stripped.startswith("delay "):
-        return {"type": "delay", "seconds": float(stripped[6:].strip())}, i
-
-    # SELECT (multi-line: options follow as indented "Label = value")
-    if stripped.startswith("select "):
-        var = stripped[7:].strip()
-        options = []
-        while i < len(lines):
-            next_line = lines[i]
-            if not next_line.strip() or next_line.strip().startswith("#"):
-                i += 1
-                continue
-            next_indent = len(next_line) - len(next_line.lstrip())
-            if next_indent <= base_indent:
-                break
-            if "=" in next_line:
-                label, _, value = next_line.strip().partition("=")
-                options.append((label.strip(), value.strip()))
-                i += 1
+def inject(text: str, data: dict):
+    def resolve(path):
+        cur = data
+        for k in path.split("."):
+            if isinstance(cur, dict):
+                cur = cur.get(k, "")
             else:
-                break
-        return {"type": "select", "var": var, "options": options}, i
+                return ""
+        return cur
+    return re.sub(r"\{(.*?)\}", lambda m: str(resolve(m.group(1))), text)
 
-    # BUTTONS (URL buttons: Label = https://...)
-    if stripped.startswith("buttons "):
-        prompt = stripped[8:].strip()
-        buttons = []
-        while i < len(lines):
-            next_line = lines[i]
-            if not next_line.strip() or next_line.strip().startswith("#"):
-                i += 1
+async def fetch_api(url):
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url) as r:
+            try:
+                return await r.json()
+            except:
+                return {"_raw": await r.text()}
+
+# ----------------- AST NODES -----------------
+
+@dataclass
+class Node:
+    type: str
+    data: dict = field(default_factory=dict)
+    children: List[Any] = field(default_factory=list)
+    else_children: List[Any] = field(default_factory=list)
+
+@dataclass
+class Flow:
+    name: str
+    body: List[Node]
+
+# ----------------- PARSER -----------------
+
+class Parser:
+    def __init__(self, script: str):
+        self.lines = [l.rstrip() for l in script.splitlines() if l.strip() and not l.strip().startswith("#")]
+        self.i = 0
+        self.token = None
+        self.flows: Dict[str, Flow] = {}
+
+    def indent(self, line):
+        return len(line) - len(line.lstrip())
+
+    def parse(self):
+        while self.i < len(self.lines):
+            line = self.lines[self.i].strip()
+
+            if line.startswith("token"):
+                self.token = line.split(" ", 1)[1].strip('"')
+
+            elif line.startswith("flow"):
+                name = line.split()[1].replace(":", "")
+                self.i += 1
+                body = self.parse_block(self.indent(self.lines[self.i-1]))
+                self.flows[name] = Flow(name, body)
                 continue
-            next_indent = len(next_line) - len(next_line.lstrip())
-            if next_indent <= base_indent:
-                break
-            if "=" in next_line:
-                label, _, url = next_line.strip().partition("=")
-                buttons.append((label.strip(), url.strip()))
-                i += 1
-            else:
-                break
-        return {"type": "buttons", "text": prompt, "buttons": buttons}, i
 
-    # IF (single or multi-line body)
-    if stripped.startswith("if "):
-        condition = stripped[3:].strip()
-        body = []
-        while i < len(lines):
-            next_line = lines[i]
-            if not next_line.strip() or next_line.strip().startswith("#"):
-                i += 1
+            self.i += 1
+
+        if not self.token:
+            raise ValueError("Token missing")
+
+        return self.token, self.flows
+
+    def parse_block(self, base_indent):
+        nodes = []
+
+        while self.i < len(self.lines):
+            raw = self.lines[self.i]
+            indent = self.indent(raw)
+
+            if indent <= base_indent:
+                break
+
+            line = raw.strip()
+
+            # SAY
+            if line.startswith("say"):
+                node = self.parse_say(line)
+                nodes.append(node)
+
+            # ASK
+            elif line.startswith("ask"):
+                node = self.parse_ask(line, indent)
+                nodes.append(node)
                 continue
-            next_indent = len(next_line) - len(next_line.lstrip())
-            if next_indent <= base_indent:
-                break
-            node, i = _parse_node(lines, i, next_indent)
-            if node:
-                body.append(node)
-        return {"type": "if", "condition": condition, "body": body}, i
 
-    return None, i
+            # DO FETCH
+            elif line.startswith("do fetch"):
+                _, _, var, _, url = line.split(" ", 4)
+                nodes.append(Node("fetch", {"var": var, "url": url.strip('"')}))
 
+            # IF
+            elif line.startswith("if"):
+                node = self.parse_if(line, indent)
+                nodes.append(node)
+                continue
 
-# ─────────────────────────────────────────────
-# UTILS
-# ─────────────────────────────────────────────
+            # GO
+            elif line.startswith("go"):
+                nodes.append(Node("go", {"flow": line.split()[1]}))
 
-def resolve(text: str, data: dict) -> str:
-    """Replace {var} and {var.key.subkey} with values from data."""
-    def replacer(m):
-        parts = m.group(1).split(".")
-        val = data
-        for p in parts:
-            if isinstance(val, dict):
-                val = val.get(p, "")
-            elif isinstance(val, list):
-                try:
-                    val = val[int(p)]
-                except (ValueError, IndexError):
-                    val = ""
-            else:
-                val = ""
-        return str(val)
-    return re.sub(r"\{([\w.]+)\}", replacer, text)
+            self.i += 1
 
+        return nodes
 
-def eval_condition(condition: str, data: dict) -> bool:
-    """
-    Evaluate a simple condition string.
-    Supports:  var == value
-               var != value
-               var contains value
-               var  (truthy check)
-    """
-    condition = condition.strip()
+    def parse_say(self, line):
+        # say "text"
+        if "photo" in line or "video" in line or "file" in line:
+            parts = line.split()
+            typ = parts[1]
+            url = parts[2].strip('"')
+            caption = ""
+            if "caption" in line:
+                caption = line.split("caption",1)[1].strip().strip('"')
+            return Node("media", {"kind": typ, "url": url, "caption": caption})
+        else:
+            text = line[4:].strip().strip('"')
+            return Node("say", {"text": text})
 
-    if " contains " in condition:
-        left, _, right = condition.partition(" contains ")
-        return right.strip() in str(data.get(left.strip(), ""))
+    def parse_ask(self, line, indent):
+        parts = line.split()
 
-    if " != " in condition:
-        left, _, right = condition.partition(" != ")
-        return str(data.get(left.strip(), "")) != right.strip()
+        # button mode
+        if line.endswith(":"):
+            var = parts[1].replace(":", "")
+            self.i += 1
+            options = []
 
-    if " == " in condition:
-        left, _, right = condition.partition(" == ")
-        return str(data.get(left.strip(), "")) == right.strip()
+            while self.i < len(self.lines):
+                l = self.lines[self.i]
+                if self.indent(l) <= indent:
+                    break
+                label, val = l.strip().split("=>")
+                options.append((label.strip().strip('"'), val.strip()))
+                self.i += 1
 
-    # truthy check
-    val = data.get(condition, "")
-    return bool(val)
+            return Node("ask_buttons", {"var": var, "options": options})
 
+        # text mode
+        var = parts[1]
+        text = line.split(" ",2)[2].strip('"')
+        return Node("ask_input", {"var": var, "text": text})
 
-async def fetch_url(url: str):
-    """Fetch a URL and return parsed JSON or raw text."""
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            content_type = resp.headers.get("Content-Type", "")
-            if "json" in content_type:
-                try:
-                    return await resp.json()
-                except Exception:
-                    pass
-            return await resp.text()
+    def parse_if(self, line, indent):
+        parts = line.replace(":", "").split()
+        key, op, val = parts[1], parts[2], parts[3].strip('"')
 
+        self.i += 1
+        children = self.parse_block(indent)
 
-# ─────────────────────────────────────────────
-# ENGINE
-# ─────────────────────────────────────────────
+        else_children = []
+        if self.i < len(self.lines) and self.lines[self.i].strip().startswith("else"):
+            self.i += 1
+            else_children = self.parse_block(indent)
 
-async def run_nodes(nodes, update, context, data):
-    """
-    Execute a list of nodes, modifying data in-place.
-    Returns a dict with:
-      - "wait": True if execution paused for user input
-      - "go": flow name if a jump was requested
-    """
-    msg = update.effective_message
+        return Node("if", {"key": key, "op": op, "val": val}, children, else_children)
 
-    for idx, node in enumerate(nodes):
-        t = node["type"]
+# ----------------- EXECUTOR -----------------
 
-        if t == "send":
-            await msg.reply_text(resolve(node["text"], data), parse_mode=ParseMode.MARKDOWN)
+class Engine:
+    def __init__(self, flows):
+        self.flows = flows
 
-        elif t == "image":
-            url = resolve(node["url"], data)
-            await msg.reply_photo(photo=url)
+    async def run(self, update, context):
+        user = context.user_data
 
-        elif t == "set":
-            data[node["var"]] = resolve(node["value"], data)
+        while True:
+            flow = user.get("flow", "start")
+            pointer = user.get("ptr", 0)
+            data = user.get("data", {})
 
-        elif t == "delay":
-            await asyncio.sleep(node["seconds"])
+            nodes = self.flows[flow].body
 
-        elif t == "fetch":
-            url = resolve(node["url"], data)
-            data[node["var"]] = await fetch_url(url)
+            if pointer >= len(nodes):
+                return
 
-        elif t == "input":
-            context.user_data.update({
-                "_waiting_for": node["var"],
-                "_resume_nodes": nodes[idx + 1:],
-                "_data": data,
-            })
-            await msg.reply_text(resolve(node["text"], data))
-            return {"wait": True}
+            node = nodes[pointer]
 
-        elif t == "select":
-            kb = [
-                [InlineKeyboardButton(label, callback_data=f"__sel__{node['var']}__{val}")]
-                for label, val in node["options"]
-            ]
-            context.user_data.update({
-                "_waiting_for": f"__select__{node['var']}",
-                "_resume_nodes": nodes[idx + 1:],
-                "_data": data,
-            })
-            await msg.reply_text(
-                f"Choose {node['var']}:",
-                reply_markup=InlineKeyboardMarkup(kb)
-            )
-            return {"wait": True}
+            # SAY
+            if node.type == "say":
+                await update.effective_message.reply_text(inject(node.data["text"], data))
+                user["ptr"] = pointer + 1
 
-        elif t == "buttons":
-            kb = [
-                [InlineKeyboardButton(label, url=url)]
-                for label, url in node["buttons"]
-            ]
-            await msg.reply_text(
-                resolve(node["text"], data),
-                reply_markup=InlineKeyboardMarkup(kb)
-            )
+            # MEDIA
+            elif node.type == "media":
+                kind = node.data["kind"]
+                fn = getattr(update.effective_message, f"reply_{kind}")
+                await fn(
+                    node.data["url"],
+                    caption=inject(node.data["caption"], data)
+                )
+                user["ptr"] = pointer + 1
 
-        elif t == "if":
-            if eval_condition(node["condition"], data):
-                result = await run_nodes(node["body"], update, context, data)
-                if result:
-                    return result  # propagate waits/jumps
+            # ASK INPUT
+            elif node.type == "ask_input":
+                user["wait"] = ("input", node.data["var"])
+                user["ptr"] = pointer + 1
+                await update.effective_message.reply_text(node.data["text"])
+                return
 
-        elif t == "go":
-            return {"go": node["flow"]}
+            # ASK BUTTONS
+            elif node.type == "ask_buttons":
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(l, callback_data=f"sel:{node.data['var']}:{v}")]
+                    for l,v in node.data["options"]
+                ])
+                user["wait"] = ("select", node.data["var"])
+                user["ptr"] = pointer + 1
+                await update.effective_message.reply_text("Choose:", reply_markup=kb)
+                return
 
-    return {}
+            # FETCH
+            elif node.type == "fetch":
+                data[node.data["var"]] = await fetch_api(node.data["url"])
+                user["ptr"] = pointer + 1
 
+            # IF
+            elif node.type == "if":
+                val = str(data.get(node.data["key"]))
+                cond = False
 
-async def execute(update, context):
-    """Main execution loop: run the current flow and follow jumps."""
-    user = context.user_data
-    flows = context.bot_data["flows"]
+                if node.data["op"] == "==":
+                    cond = val == node.data["val"]
+                elif node.data["op"] == "contains":
+                    cond = node.data["val"] in val
 
-    # Resume from a mid-flow pause (input/select)
-    resume_nodes = user.pop("_resume_nodes", None)
-    data = user.pop("_data", user.get("data", {}))
-    flow = user.get("flow", "start")
+                block = node.children if cond else node.else_children
+                await self.run_block(block, update, context)
+                user["ptr"] = pointer + 1
 
-    if resume_nodes is not None:
-        nodes = resume_nodes
-    else:
-        nodes = flows.get(flow, [])
-        data = user.get("data", {})
+            # GO
+            elif node.type == "go":
+                user["flow"] = node.data["flow"]
+                user["ptr"] = 0
+                return
 
-    # Follow jumps (go) up to a safety limit
-    for _ in range(50):
-        result = await run_nodes(nodes, update, context, data)
-
-        if result.get("wait"):
             user["data"] = data
-            return
 
-        target = result.get("go")
-        if target:
-            flow = target
-            user["flow"] = flow
-            nodes = flows.get(flow, [])
-            continue
+    async def run_block(self, nodes, update, context):
+        for node in nodes:
+            # minimal inline execution (no pause here)
+            if node.type == "say":
+                await update.effective_message.reply_text(
+                    inject(node.data["text"], context.user_data.get("data", {}))
+                )
+            elif node.type == "go":
+                context.user_data["flow"] = node.data["flow"]
+                context.user_data["ptr"] = 0
+                return
 
-        # flow finished normally
-        user["data"] = data
-        user["flow"] = flow
-        return
-
-    # Safety: loop limit hit
-    await update.effective_message.reply_text("⚠️ Flow loop limit reached.")
-
-
-# ─────────────────────────────────────────────
-# TELEGRAM HANDLERS
-# ─────────────────────────────────────────────
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    context.user_data["flow"] = "start"
-    await execute(update, context)
-
-
-async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Allow users to restart the bot at any time with /restart."""
-    await cmd_start(update, context)
-
-
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = context.user_data
-    waiting_for = user.pop("_waiting_for", None)
-
-    if waiting_for and not waiting_for.startswith("__select__"):
-        # store the user's text in data
-        data = user.get("_data", user.get("data", {}))
-        data[waiting_for] = update.message.text
-        user["_data"] = data
-
-    await execute(update, context)
-
-
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user = context.user_data
-
-    if query.data.startswith("__sel__"):
-        # format: __sel__<var>__<value>
-        _, _, rest = query.data.partition("__sel__")
-        var, _, val = rest.partition("__")
-        data = user.get("_data", user.get("data", {}))
-        data[var] = val
-        user["_data"] = data
-        user.pop("_waiting_for", None)
-
-    await execute(query, context)
-
-
-# ─────────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────────
+# ----------------- TELEGRAM -----------------
 
 def run(script: str):
-    """Parse the DSL script and start the Telegram bot."""
-    token, flows = parse(script)
-
-    if not token:
-        raise ValueError("No token found in script. Add: token YOUR_BOT_TOKEN")
-    if not flows:
-        raise ValueError("No flows found in script. Add at least: flow start")
+    token, flows = Parser(script).parse()
+    engine = Engine(flows)
 
     app = ApplicationBuilder().token(token).build()
-    app.bot_data["flows"] = flows
+    app.bot_data["engine"] = engine
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("restart", cmd_restart))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-    app.add_handler(CallbackQueryHandler(on_button))
+    async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data.clear()
+        context.user_data.update({"flow": "start", "ptr": 0, "data": {}})
+        await engine.run(update, context)
 
-    print(f"BotFlow v2 running — {len(flows)} flow(s) loaded: {', '.join(flows)}")
+    async def message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = context.user_data
+        if "wait" in user:
+            typ, var = user.pop("wait")
+            user["data"][var] = update.message.text
+        await engine.run(update, context)
+
+    async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        user = context.user_data
+
+        if q.data.startswith("sel:"):
+            _, var, val = q.data.split(":")
+            user["data"][var] = val
+
+        await engine.run(q, context)
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message))
+    app.add_handler(CallbackQueryHandler(button))
+
+    print("BotFlow v3 running...")
     app.run_polling()
